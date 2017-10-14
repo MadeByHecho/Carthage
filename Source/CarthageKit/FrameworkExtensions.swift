@@ -1,264 +1,439 @@
-//
-//  FrameworkExtensions.swift
-//  Carthage
-//
-//  Created by Justin Spahr-Summers on 2014-10-31.
-//  Copyright (c) 2014 Carthage. All rights reserved.
-//
-
-import Argo
 import Foundation
 import Result
-import ReactiveCocoa
+import ReactiveSwift
 
 extension String {
 	/// Returns a producer that will enumerate each line of the receiver, then
 	/// complete.
 	internal var linesProducer: SignalProducer<String, NoError> {
-		return SignalProducer { observer, disposable in
-			(self as NSString).enumerateLinesUsingBlock { (line, stop) in
-				sendNext(observer, line)
+		return SignalProducer { observer, lifetime in
+			self.enumerateLines { line, stop in
+				observer.send(value: line)
 
-				if disposable.disposed {
-					stop.memory = true
+				if lifetime.hasEnded {
+					stop = true
 				}
 			}
 
-			sendCompleted(observer)
+			observer.sendCompleted()
+		}
+	}
+
+	/// Strips off a trailing string, if present.
+	internal func stripping(suffix: String) -> String {
+		if hasSuffix(suffix) {
+			let end = characters.index(endIndex, offsetBy: -suffix.count)
+			return String(self[startIndex..<end])
+		} else {
+			return self
 		}
 	}
 }
 
-/// Merges `rhs` into `lhs` and returns the result.
-internal func combineDictionaries<K, V>(lhs: [K: V], rhs: [K: V]) -> [K: V] {
-	var result = lhs
-	for (key, value) in rhs {
-		result.updateValue(value, forKey: key)
-	}
+extension Signal {
+	/// Sends each value that occurs on `signal` combined with each value that
+	/// occurs on `otherSignal` (repeats included).
+	fileprivate func permute<U>(with otherSignal: Signal<U, Error>) -> Signal<(Value, U), Error> {
+		// swiftlint:disable:previous cyclomatic_complexity function_body_length
+		return Signal<(Value, U), Error> { observer in
+			let lock = NSLock()
+			lock.name = "org.carthage.CarthageKit.permute"
 
-	return result
-}
+			var signalValues: [Value] = []
+			var signalCompleted = false
+			var otherValues: [U] = []
+			var otherCompleted = false
 
-/// Sends each value that occurs on `signal` combined with each value that
-/// occurs on `otherSignal` (repeats included).
-internal func permuteWith<T, U, E>(otherSignal: Signal<U, E>)(signal: Signal<T, E>) -> Signal<(T, U), E> {
-	return Signal { observer in
-		let lock = NSRecursiveLock()
-		lock.name = "org.carthage.CarthageKit.permuteWith"
+			let compositeDisposable = CompositeDisposable()
 
-		var signalValues: [T] = []
-		var signalCompleted = false
-		var otherValues: [U] = []
-		var otherCompleted = false
+			compositeDisposable += self.observe { event in
+				switch event {
+				case let .value(value):
+					lock.lock()
 
-		let signalDisposable = signal.observe(next: { value in
-			lock.lock()
+					signalValues.append(value)
+					for otherValue in otherValues {
+						observer.send(value: (value, otherValue))
+					}
 
-			signalValues.append(value)
-			for otherValue in otherValues {
-				sendNext(observer, (value, otherValue))
-			}
+					lock.unlock()
 
-			lock.unlock()
-		}, error: { error in
-			sendError(observer, error)
-		}, completed: {
-			lock.lock()
+				case let .failed(error):
+					observer.send(error: error)
 
-			signalCompleted = true
-			if otherCompleted {
-				sendCompleted(observer)
-			}
+				case .completed:
+					lock.lock()
 
-			lock.unlock()
-		}, interrupted: {
-			sendInterrupted(observer)
-		})
+					signalCompleted = true
+					if otherCompleted {
+						observer.sendCompleted()
+					}
 
-		let otherDisposable = otherSignal.observe(next: { value in
-			lock.lock()
+					lock.unlock()
 
-			otherValues.append(value)
-			for signalValue in signalValues {
-				sendNext(observer, (signalValue, value))
-			}
-
-			lock.unlock()
-		}, error: { error in
-			sendError(observer, error)
-		}, completed: {
-			lock.lock()
-
-			otherCompleted = true
-			if signalCompleted {
-				sendCompleted(observer)
-			}
-
-			lock.unlock()
-		}, interrupted: {
-			sendInterrupted(observer)
-		})
-
-		let compositeDisposable = CompositeDisposable()
-		compositeDisposable.addDisposable(signalDisposable)
-		compositeDisposable.addDisposable(otherDisposable)
-		return compositeDisposable
-	}
-}
-
-/// Sends each value that occurs on `producer` combined with each value that
-/// occurs on `otherProducer` (repeats included).
-internal func permuteWith<T, U, E>(otherProducer: SignalProducer<U, E>)(producer: SignalProducer<T, E>) -> SignalProducer<(T, U), E> {
-	return producer.lift(permuteWith)(otherProducer)
-}
-
-/// Dematerializes the signal, like dematerialize(), but only yields inner Error
-/// events if no values were sent.
-internal func dematerializeErrorsIfEmpty<T, E>(signal: Signal<Event<T, E>, E>) -> Signal<T, E> {
-	return Signal { observer in
-		var receivedValue = false
-		var receivedError: E? = nil
-
-		return signal.observe(next: { event in
-			switch event {
-			case let .Next(value):
-				receivedValue = true
-				sendNext(observer, value.value)
-
-			case let .Error(error):
-				receivedError = error.value
-
-			case .Completed:
-				sendCompleted(observer)
-
-			case .Interrupted:
-				sendInterrupted(observer)
-			}
-		}, error: { error in
-			sendError(observer, error)
-		}, completed: {
-			if !receivedValue {
-				if let receivedError = receivedError {
-					sendError(observer, receivedError)
+				case .interrupted:
+					observer.sendInterrupted()
 				}
 			}
 
-			sendCompleted(observer)
-		}, interrupted: {
-			sendInterrupted(observer)
-		})
+			compositeDisposable += otherSignal.observe { event in
+				switch event {
+				case let .value(value):
+					lock.lock()
+
+					otherValues.append(value)
+					for signalValue in signalValues {
+						observer.send(value: (signalValue, value))
+					}
+
+					lock.unlock()
+
+				case let .failed(error):
+					observer.send(error: error)
+
+				case .completed:
+					lock.lock()
+
+					otherCompleted = true
+					if signalCompleted {
+						observer.sendCompleted()
+					}
+
+					lock.unlock()
+
+				case .interrupted:
+					observer.sendInterrupted()
+				}
+			}
+
+			return compositeDisposable
+		}
 	}
 }
 
-/// Sends all permutations of the values from the input producers, as they arrive.
-///
-/// If no input producers are given, sends a single empty array then completes.
-internal func permutations<T, E>(producers: [SignalProducer<T, E>]) -> SignalProducer<[T], E> {
-	var combined: SignalProducer<[T], E> = SignalProducer(value: [])
+extension SignalProducer {
+	/// Sends each value that occurs on `producer` combined with each value that
+	/// occurs on `otherProducer` (repeats included).
+	fileprivate func permute<U>(with otherProducer: SignalProducer<U, Error>) -> SignalProducer<(Value, U), Error> {
+		return lift(Signal.permute(with:))(otherProducer)
+	}
 
-	for producer in producers {
-		combined = combined
-			|> permuteWith(producer)
-			|> map { (var array, value) in
-				array.append(value)
-				return array
+	/// Sends a boolean of whether the producer succeeded or failed.
+	internal func succeeded() -> SignalProducer<Bool, NoError> {
+		return self
+			.then(SignalProducer<Bool, Error>(value: true))
+			.flatMapError { _ in .init(value: false) }
+	}
+}
+
+extension SignalProducer where Value: SignalProducerProtocol, Error == Value.Error {
+	/// Sends all permutations of the values from the inner producers, as they arrive.
+	///
+	/// If no producers are received, sends a single empty array then completes.
+	internal func permute() -> SignalProducer<[Value.Value], Error> {
+		return self
+			.collect()
+			.flatMap(.concat) { (producers: [Value]) -> SignalProducer<[Value.Value], Error> in
+				var combined = SignalProducer<[Value.Value], Error>(value: [])
+
+				for producer in producers {
+					combined = combined
+						.permute(with: producer.producer)
+						.map { array, value in
+							var array = array
+							array.append(value)
+							return array
+						}
+				}
+
+				return combined
 			}
 	}
-
-	return combined
 }
 
-extension NSScanner {
+extension Signal where Value: EventProtocol, Value.Error == Error {
+	/// Dematerializes the signal, like dematerialize(), but only yields inner
+	/// Error events if no values were sent.
+	internal func dematerializeErrorsIfEmpty() -> Signal<Value.Value, Error> {
+		return Signal<Value.Value, Error> { observer in
+			var receivedValue = false
+			var receivedError: Error?
+
+			return self.observe { event in
+				switch event {
+				case let .value(innerEvent):
+					switch innerEvent.event {
+					case let .value(value):
+						receivedValue = true
+						observer.send(value: value)
+
+					case let .failed(error):
+						receivedError = error
+
+					case .completed:
+						observer.sendCompleted()
+
+					case .interrupted:
+						observer.sendInterrupted()
+					}
+
+				case let .failed(error):
+					observer.send(error: error)
+
+				case .completed:
+					if let receivedError = receivedError, !receivedValue {
+						observer.send(error: receivedError)
+					}
+
+					observer.sendCompleted()
+
+				case .interrupted:
+					observer.sendInterrupted()
+				}
+			}
+		}
+	}
+}
+
+extension SignalProducer where Value: EventProtocol, Value.Error == Error {
+	/// Dematerializes the producer, like dematerialize(), but only yields inner
+	/// Error events if no values were sent.
+	internal func dematerializeErrorsIfEmpty() -> SignalProducer<Value.Value, Error> {
+		return lift { $0.dematerializeErrorsIfEmpty() }
+	}
+}
+
+extension Scanner {
 	/// Returns the current line being scanned.
-	internal var currentLine: NSString {
+	internal var currentLine: String {
 		// Force Foundation types, so we don't have to use Swift's annoying
 		// string indexing.
-		let nsString: NSString = string
-		let scanRange: NSRange = NSMakeRange(scanLocation, 0)
-		let lineRange: NSRange = nsString.lineRangeForRange(scanRange)
+		let nsString = string as NSString
+		let scanRange: NSRange = NSRange(location: scanLocation, length: 0)
+		let lineRange: NSRange = nsString.lineRange(for: scanRange)
 
-		return nsString.substringWithRange(lineRange)
+		return nsString.substring(with: lineRange)
 	}
 }
 
-extension NSURLSession {
-	/// Returns a producer that will download a file using the given request. The
-	/// file will be deleted after the producer terminates.
-	internal func carthage_downloadWithRequest(request: NSURLRequest) -> SignalProducer<(NSURL, NSURLResponse), NSError> {
-		return SignalProducer { observer, disposable in
-			let serialDisposable = SerialDisposable()
-			let handle = disposable.addDisposable(serialDisposable)
+extension Result where Error == CarthageError {
+	/// Constructs a result from a throwing closure taking a `URL`, failing with `CarthageError` if throw occurs.
+	/// - parameter carthageError: Defaults to `CarthageError.writeFailed`.
+	internal init(
+		at url: URL,
+		carthageError: (URL, NSError) -> CarthageError = CarthageError.writeFailed,
+		attempt closure: (URL) throws -> Value
+	) {
+		do {
+			self = .success(try closure(url))
+		} catch let error as NSError {
+			self = .failure(carthageError(url, error))
+		}
+	}
+}
 
-			let task = self.downloadTaskWithRequest(request) { (URL, response, error) in
-				// Avoid invoking cancel(), or the download may be deleted.
-				handle.remove()
+extension URL {
+	/// The type identifier of the receiver, or an error if it was unable to be
+	/// determined.
+	internal var typeIdentifier: Result<String, CarthageError> {
+		var error: NSError?
 
-				if URL == nil || response == nil {
-					sendError(observer, error)
-				} else {
-					let value = (URL!, response!)
-					sendNext(observer, value)
-					sendCompleted(observer)
+		do {
+			let typeIdentifier = try resourceValues(forKeys: [ .typeIdentifierKey ]).typeIdentifier
+			if let identifier = typeIdentifier {
+				return .success(identifier)
+			}
+		} catch let err as NSError {
+			error = err
+		}
+
+		return .failure(.readFailed(self, error))
+	}
+
+	public func hasSubdirectory(_ possibleSubdirectory: URL) -> Bool {
+		let standardizedSelf = self.standardizedFileURL
+		let standardizedOther = possibleSubdirectory.standardizedFileURL
+
+		let path = standardizedSelf.pathComponents
+		let otherPath = standardizedOther.pathComponents
+		if scheme == standardizedOther.scheme && path.count <= otherPath.count {
+			return Array(otherPath[path.indices]) == path
+		}
+
+		return false
+	}
+
+	fileprivate func volumeSupportsFileCloning() throws -> Bool {
+		guard #available(macOS 10.12, *) else { return false }
+
+		let key = URLResourceKey.volumeSupportsFileCloningKey
+		let values = try self.resourceValues(forKeys: [key]).allValues
+
+		func error(failureReason: String) -> NSError {
+			return NSError(
+				domain: NSCocoaErrorDomain,
+				code: CocoaError.fileReadUnknown.rawValue,
+				userInfo: [NSURLErrorKey: self, NSLocalizedFailureReasonErrorKey: failureReason]
+			)
+		}
+
+		guard values.count == 1 else {
+			throw error(failureReason: "Expected single resource value: «actual count: \(values.count)».")
+		}
+
+		guard let volumeSupportsFileCloning = values[key] as? NSNumber else {
+			throw error(failureReason: "Unable to extract a NSNumber from «\(String(describing: values.first))».")
+		}
+
+		return volumeSupportsFileCloning.boolValue
+	}
+
+	/// Returns the first `URL` to match `<self>/Headers/*-Swift.h`. Otherwise `nil`.
+	internal func swiftHeaderURL() -> URL? {
+		let headersURL = self.appendingPathComponent("Headers", isDirectory: true).resolvingSymlinksInPath()
+		let dirContents = try? FileManager.default.contentsOfDirectory(at: headersURL, includingPropertiesForKeys: [], options: [])
+		return dirContents?.first { $0.absoluteString.contains("-Swift.h") }
+	}
+
+	/// Returns the first `URL` to match `<self>/Modules/*.swiftmodule`. Otherwise `nil`.
+	internal func swiftmoduleURL() -> URL? {
+		let headersURL = self.appendingPathComponent("Modules", isDirectory: true).resolvingSymlinksInPath()
+		let dirContents = try? FileManager.default.contentsOfDirectory(at: headersURL, includingPropertiesForKeys: [], options: [])
+		return dirContents?.first { $0.absoluteString.contains("swiftmodule") }
+	}
+}
+
+extension FileManager: ReactiveExtensionsProvider {
+	@available(*, deprecated, message: "Use reactive.enumerator instead")
+	public func carthage_enumerator(
+		at url: URL, includingPropertiesForKeys keys: [URLResourceKey]? = nil,
+		options: FileManager.DirectoryEnumerationOptions = [],
+		catchErrors: Bool = false
+	) -> SignalProducer<(FileManager.DirectoryEnumerator, URL), CarthageError> {
+		return reactive.enumerator(at: url, includingPropertiesForKeys: keys, options: options, catchErrors: catchErrors)
+	}
+
+	// swiftlint:disable identifier_name
+	/// rdar://32984063 When on APFS, `FileManager.copyItem(at:to)` can result in zero'd out binary files, due to the cloning functionality.
+	/// To avoid this, we drop down to the copyfile c API, explicitly not passing the 'CLONE' flags so we always copy the data normally.
+	/// - Parameter avoiding·rdar·32984063: When `false`, passthrough to Foundation’s `FileManager.copyItem(at:to:)`.
+	internal func copyItem(at from: URL, to: URL, avoiding·rdar·32984063: Bool) throws {
+		guard avoiding·rdar·32984063, try from.volumeSupportsFileCloning() else {
+			return try self.copyItem(at: from, to: to)
+		}
+
+		try from.path.withCString { fromCStr in
+			try to.path.withCString { toCStr in
+				let state = copyfile_state_alloc()
+				let status = copyfile(fromCStr, toCStr, state, UInt32(COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW))
+				copyfile_state_free(state)
+				if status < 0 {
+					throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
 				}
 			}
-
-			serialDisposable.innerDisposable = ActionDisposable {
-				task.cancel()
-			}
-
-			task.resume()
 		}
 	}
 }
 
-extension NSURL: Decodable {
-	public class func decode(json: JSON) -> Decoded<NSURL> {
-		return String.decode(json).flatMap { URLString in
-			return .fromOptional(self(string: URLString))
-		}
-	}
-}
-
-extension NSFileManager {
+extension Reactive where Base: FileManager {
 	/// Creates a directory enumerator at the given URL. Sends each URL
 	/// enumerated, along with the enumerator itself (so it can be introspected
 	/// and modified as enumeration progresses).
-	public func carthage_enumeratorAtURL(URL: NSURL, includingPropertiesForKeys keys: [String], options: NSDirectoryEnumerationOptions, catchErrors: Bool = false) -> SignalProducer<(NSDirectoryEnumerator, NSURL), CarthageError> {
-		return SignalProducer { observer, disposable in
-			let enumerator = self.enumeratorAtURL(URL, includingPropertiesForKeys: keys, options: options) { (URL, error) in
+	public func enumerator(
+		at url: URL,
+		includingPropertiesForKeys keys: [URLResourceKey]? = nil,
+		options: FileManager.DirectoryEnumerationOptions = [],
+		catchErrors: Bool = false
+	) -> SignalProducer<(FileManager.DirectoryEnumerator, URL), CarthageError> {
+		return SignalProducer { [base = self.base] observer, lifetime in
+			let enumerator = base.enumerator(at: url, includingPropertiesForKeys: keys, options: options) { url, error in
 				if catchErrors {
 					return true
 				} else {
-					sendError(observer, CarthageError.ReadFailed(URL, error))
+					observer.send(error: CarthageError.readFailed(url, error as NSError))
 					return false
 				}
 			}!
 
-			while !disposable.disposed {
-				if let URL = enumerator.nextObject() as? NSURL {
-					let value = (enumerator, URL)
-					sendNext(observer, value)
+			while !lifetime.hasEnded {
+				if let url = enumerator.nextObject() as? URL {
+					let value = (enumerator, url)
+					observer.send(value: value)
 				} else {
 					break
 				}
 			}
 
-			sendCompleted(observer)
+			observer.sendCompleted()
 		}
+	}
+
+	/// Creates a temporary directory with the given template name. Sends the
+	/// URL of the temporary directory and completes if successful, else errors.
+	///
+	/// The template name should adhere to the format required by the mkdtemp()
+	/// function.
+	public func createTemporaryDirectoryWithTemplate(_ template: String) -> SignalProducer<URL, CarthageError> {
+		return SignalProducer { [base = self.base] () -> Result<String, CarthageError> in
+			let temporaryDirectory: NSString
+			if #available(macOS 10.12, *) {
+				temporaryDirectory = base.temporaryDirectory.path as NSString
+			} else {
+				temporaryDirectory = NSTemporaryDirectory() as NSString
+			}
+
+			var temporaryDirectoryTemplate: ContiguousArray<CChar> = temporaryDirectory.appendingPathComponent(template).utf8CString
+
+			let result: UnsafeMutablePointer<Int8>? = temporaryDirectoryTemplate
+				.withUnsafeMutableBufferPointer { (template: inout UnsafeMutableBufferPointer<CChar>) -> UnsafeMutablePointer<CChar> in
+					mkdtemp(template.baseAddress)
+				}
+
+			if result == nil {
+				return .failure(.taskError(.posixError(errno)))
+			}
+
+			let temporaryPath = temporaryDirectoryTemplate.withUnsafeBufferPointer { (ptr: UnsafeBufferPointer<CChar>) -> String in
+				return String(validatingUTF8: ptr.baseAddress!)!
+			}
+
+			return .success(temporaryPath)
+		}
+		.map { URL(fileURLWithPath: $0, isDirectory: true) }
 	}
 }
 
-/// Creates a counted set from a sequence. The counted set is represented as a
-/// dictionary where the keys are elements from the sequence and values count
-/// how many times elements are present in the sequence.
-internal func buildCountedSet<S: SequenceType>(sequence: S) -> [S.Generator.Element: Int] {
-	return reduce(sequence, [:]) { (var set, elem) in
-		if let count = set[elem] {
-			set[elem] = count + 1
+private let defaultSessionError = NSError(domain: Constants.bundleIdentifier, code: 1, userInfo: nil)
+
+extension Reactive where Base: URLSession {
+	/// Returns a SignalProducer which performs a downloadTask associated with an
+	/// `NSURLSession`
+	///
+	/// - parameters:
+	///   - request: A request that will be performed when the producer is
+	///              started
+	///
+	/// - returns: A producer that will execute the given request once for each
+	///            invocation of `start()`.
+	///
+	/// - note: This method will not send an error event in the case of a server
+	///         side error (i.e. when a response with status code other than
+	///         200...299 is received).
+	internal func download(with request: URLRequest) -> SignalProducer<(URL, URLResponse), AnyError> {
+		return SignalProducer { [base = self.base] observer, lifetime in
+			let task = base.downloadTask(with: request) { url, response, error in
+				if let url = url, let response = response {
+					observer.send(value: (url, response))
+					observer.sendCompleted()
+				} else {
+					observer.send(error: AnyError(error ?? defaultSessionError))
+				}
+			}
+
+			lifetime.observeEnded {
+				task.cancel()
+			}
+			task.resume()
 		}
-		else {
-			set[elem] = 1
-		}
-		return set
 	}
 }
